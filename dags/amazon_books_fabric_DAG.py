@@ -6,7 +6,7 @@
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.providers.microsoft.fabric.operators.fabric import FabricRunItemOperator
+# from airflow.providers.microsoft.fabric.operators.fabric import FabricRunItemOperator
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -147,14 +147,14 @@ with DAG(
         python_callable=upload_to_onelake,
     )
 
-    trigger_fabric_notebook = FabricRunItemOperator(
-        task_id="trigger_fabric_notebook",
-        fabric_conn_id=FABRIC_CONN_ID,
-        workspace_id=FABRIC_WORKSPACE_ID,
-        item_id=FABRIC_NOTEBOOK_ITEM_ID,
-        check_interval_seconds=10,
-        timeout_seconds=3600,
-    )
+    #trigger_fabric_notebook = FabricRunItemOperator(
+     #   task_id="trigger_fabric_notebook",
+      #  fabric_conn_id=FABRIC_CONN_ID,
+       # workspace_id=FABRIC_WORKSPACE_ID,
+        #item_id=FABRIC_NOTEBOOK_ITEM_ID,
+        #check_interval_seconds=10,
+        #timeout_seconds=3600,
+    #)
 
-    fetch_amazon_books_task >> clean_book_data_task >> upload_to_onelake_task >> trigger_fabric_notebook
+    fetch_amazon_books_task >> clean_book_data_task >> upload_to_onelake_task
 

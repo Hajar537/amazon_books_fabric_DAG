@@ -41,7 +41,7 @@ HEADERS = {
 # ETL TASKS
 # ────────────────────────────────────────────────
 
-def fetch_amazon_books(num_books, ti):
+def FETCH_amazon_books(num_books, ti):
     base_url = "https://www.amazon.com/s?k=data+engineering+books"
     books, seen_titles = [], set()
     page = 1

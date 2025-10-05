@@ -1,1 +1,160 @@
+# amazon_books_fabric_dag.py
+# Airflow DAG for Microsoft Fabric
+# Extracts Amazon book data → cleans with pandas → uploads CSV to OneLake
+# Optional: triggers a Fabric notebook or pipeline for downstream analytics
+
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.microsoft.fabric.operators.fabric import FabricRunItemOperator
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+from azure.storage.blob import BlobServiceClient
+import os
+
+# ────────────────────────────────────────────────
+# CONFIG — replace placeholders
+# ────────────────────────────────────────────────
+NUM_BOOKS = 50
+FABRIC_CONN_ID = "amazon-books"             # connection name in Airflow UI
+FABRIC_WORKSPACE_ID = "<YOUR_FABRIC_WORKSPACE_ID>"
+FABRIC_NOTEBOOK_ITEM_ID = "<YOUR_FABRIC_NOTEBOOK_OR_PIPELINE_ITEM_ID>"
+STORAGE_ACCOUNT_URL = os.getenv("AZURE_STORAGE_ACCOUNT_URL")  # or set Airflow variable
+STORAGE_CONTAINER = "fabric-data"
+SAS_TOKEN = os.getenv("AZURE_SAS_TOKEN")  # or managed identity
+UPLOAD_BLOB_PATH = "amazon/books.csv"
+
+HEADERS = {
+    "Referer": "https://www.amazon.com/",
+    "Sec-Ch-Ua": "Not_A Brand",
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": "macOS",
+    "User-agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+        " AppleWebKit/537.36 (KHTML, like Gecko)"
+        " Chrome/107.0.0.0 Safari/537.36"
+    ),
+}
+
+# ────────────────────────────────────────────────
+# ETL TASKS
+# ────────────────────────────────────────────────
+
+def fetch_amazon_books(num_books, ti):
+    base_url = "https://www.amazon.com/s?k=data+engineering+books"
+    books, seen_titles = [], set()
+    page = 1
+
+    while len(books) < num_books:
+        url = f"{base_url}&page={page}"
+        response = requests.get(url, headers=HEADERS, timeout=30)
+
+        if response.status_code != 200:
+            print(f"❌ Failed to retrieve page {page}")
+            break
+
+        soup = BeautifulSoup(response.content, "html.parser")
+        book_containers = soup.find_all("div", {"class": "s-result-item"})
+
+        for book in book_containers:
+            title = book.find("span", {"class": "a-text-normal"})
+            author = book.find("a", {"class": "a-size-base"})
+            price = book.find("span", {"class": "a-price-whole"})
+            rating = book.find("span", {"class": "a-icon-alt"})
+
+            if title and author and price and rating:
+                book_title = title.text.strip()
+                if book_title not in seen_titles:
+                    seen_titles.add(book_title)
+                    books.append({
+                        "Title": book_title,
+                        "Author": author.text.strip(),
+                        "Price": price.text.strip(),
+                        "Rating": rating.text.strip(),
+                    })
+
+        page += 1
+
+    df = pd.DataFrame(books[:num_books]).drop_duplicates(subset="Title")
+    ti.xcom_push(key="book_data", value=df.to_dict("records"))
+    print(f"✅ Extracted {len(df)} books")
+
+
+def clean_book_data(ti):
+    book_data = ti.xcom_pull(key="book_data", task_ids="fetch_amazon_books")
+    if not book_data:
+        raise ValueError("No book data found for cleaning")
+
+    df = pd.DataFrame(book_data)
+    df["etl_processed_at"] = datetime.utcnow().isoformat()
+    df["Price"] = df["Price"].str.replace(",", "")
+    df["Rating"] = df["Rating"].str.extract(r"(\d+\.\d+)").astype(float)
+    file_path = "/tmp/amazon_books_clean.csv"
+    df.to_csv(file_path, index=False)
+    ti.xcom_push(key="clean_file_path", value=file_path)
+    print("✅ Data cleaned and saved locally")
+
+
+def upload_to_onelake(ti):
+    file_path = ti.xcom_pull(key="clean_file_path", task_ids="clean_book_data")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    blob_service = BlobServiceClient(account_url=STORAGE_ACCOUNT_URL, credential=SAS_TOKEN)
+    container_client = blob_service.get_container_client(STORAGE_CONTAINER)
+
+    with open(file_path, "rb") as data:
+        container_client.upload_blob(name=UPLOAD_BLOB_PATH, data=data, overwrite=True)
+
+    blob_url = f"{STORAGE_ACCOUNT_URL}/{STORAGE_CONTAINER}/{UPLOAD_BLOB_PATH}"
+    ti.xcom_push(key="blob_url", value=blob_url)
+    print(f"✅ Uploaded to OneLake: {blob_url}")
+
+# ────────────────────────────────────────────────
+# DAG DEFINITION
+# ────────────────────────────────────────────────
+default_args = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "start_date": datetime(2025, 1, 1),
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id="amazon_books_fabric_dag",
+    default_args=default_args,
+    description="Extract Amazon book data and store it in OneLake via Fabric Airflow Job",
+    schedule_interval=timedelta(days=1),
+    catchup=False,
+    tags=["fabric", "onelake", "amazon", "etl"],
+) as dag:
+
+    fetch_amazon_books_task = PythonOperator(
+        task_id="fetch_amazon_books",
+        python_callable=fetch_amazon_books,
+        op_args=[NUM_BOOKS],
+    )
+
+    clean_book_data_task = PythonOperator(
+        task_id="clean_book_data",
+        python_callable=clean_book_data,
+    )
+
+    upload_to_onelake_task = PythonOperator(
+        task_id="upload_to_onelake",
+        python_callable=upload_to_onelake,
+    )
+
+    trigger_fabric_notebook = FabricRunItemOperator(
+        task_id="trigger_fabric_notebook",
+        fabric_conn_id=FABRIC_CONN_ID,
+        workspace_id=FABRIC_WORKSPACE_ID,
+        item_id=FABRIC_NOTEBOOK_ITEM_ID,
+        check_interval_seconds=10,
+        timeout_seconds=3600,
+    )
+
+    fetch_amazon_books_task >> clean_book_data_task >> upload_to_onelake_task >> trigger_fabric_notebook
 

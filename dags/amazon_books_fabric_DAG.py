@@ -156,5 +156,5 @@ with DAG(
         #timeout_seconds=3600,
     #)
 
-    fetch_amazon_books_task >> clean_book_data_task >> upload_to_onelake_task
+    FETCH_amazon_books_task >> clean_book_data_task >> upload_to_onelake_task
 

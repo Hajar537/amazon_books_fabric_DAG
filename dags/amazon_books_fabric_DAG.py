@@ -131,9 +131,9 @@ with DAG(
     tags=["fabric", "onelake", "amazon", "etl"],
 ) as dag:
 
-    fetch_amazon_books_task = PythonOperator(
+    FETCH_amazon_books_task = PythonOperator(
         task_id="fetch_amazon_books",
-        python_callable=fetch_amazon_books,
+        python_callable=FETCH_amazon_books,
         op_args=[NUM_BOOKS],
     )
 

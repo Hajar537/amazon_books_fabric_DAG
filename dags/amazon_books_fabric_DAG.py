@@ -191,7 +191,6 @@ with DAG(
         op_args=[NUM_BOOKS],
     )
 
-
     clean_book_data_task = PythonOperator(
         task_id="clean_book_data",
         python_callable=clean_book_data,
@@ -209,7 +208,8 @@ with DAG(
         #item_id=FABRIC_NOTEBOOK_ITEM_ID,
         #check_interval_seconds=10,
         #timeout_seconds=3600,
-    #)
+    
 
-    FETCH_amazon_books_task >> clean_book_data_task >> upload_to_onelake_task
+    fetch_amazon_books_task >> clean_book_data_task >> upload_to_onelake_task
+
 

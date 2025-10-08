@@ -10,7 +10,7 @@ from airflow.operators.python import PythonOperator
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
-from azure.storage.blob import BlobServiceClient
+#from azure.storage.blob import BlobServiceClient
 import os
 
 # ────────────────────────────────────────────────
@@ -128,8 +128,18 @@ def clean_book_data(**context):
 
     df = pd.DataFrame(book_data)
     df["etl_processed_at"] = datetime.utcnow().isoformat()
-    df["Price"] = df["Price"].astype(str).str.replace(",", "")
-    df["Rating"] = df["Rating"].astype(str).str.extract(r"(\d+\.\d+)").astype(float)
+    df["Price"] = (
+    df["Price"].astype(str)
+        .str.replace(",", "", regex=False)
+        .replace("None", pd.NA)
+    )
+    df["Rating"] = (
+        df["Rating"].astype(str)
+        .str.extract(r"(\d+\.\d+)", expand=False)
+        .astype(float)
+        .fillna(0)
+    )
+
 
     # Push back to XCom instead of saving locally
     ti.xcom_push(key="cleaned_books", value=df.to_dict("records"))
@@ -143,7 +153,7 @@ def upload_to_onelake(**context):
         raise ValueError("No cleaned book data found")
 
     df = pd.DataFrame(cleaned_books)
-    local_path = "/lakehouse/default/Files/raw_data/books.csv"  # mounted path in Fabric
+    local_path = "/lakehouse/amzon/Files/raw_data/books.csv"  # mounted path in Fabric
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     df.to_csv(local_path, index=False)
 

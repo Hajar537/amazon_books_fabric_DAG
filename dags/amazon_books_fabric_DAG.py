@@ -1,4 +1,4 @@
-# amazon_books_fabric_dag.py
+# amazon_books_fabric_dag_fixed.py
 # Airflow DAG for Microsoft Fabric
 # Extracts Amazon book data → cleans with pandas → uploads CSV to OneLake
 # Optional: triggers a Fabric notebook or pipeline for downstream analytics
@@ -6,24 +6,25 @@
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-# from airflow.providers.microsoft.fabric.operators.fabric import FabricRunItemOperator
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
-from azure.storage.filedatalake import DataLakeServiceClient
 from io import StringIO
-#from azure.storage.blob import BlobServiceClient
 import os
+import time, random
+from airflow.exceptions import AirflowFailException
+
+# ✅ NEW IMPORTS for OneLake upload
+from azure.identity import DefaultAzureCredential
+from azure.storage.filedatalake import DataLakeServiceClient
 
 # ────────────────────────────────────────────────
-# CONFIG — replace placeholders
+# CONFIGURATION
 # ────────────────────────────────────────────────
 NUM_BOOKS = 50
-FABRIC_CONN_ID = "amazon-books"             # connection name in Airflow UI
-#FABRIC_WORKSPACE_ID = "<YOUR_FABRIC_WORKSPACE_ID>"
-#FABRIC_NOTEBOOK_ITEM_ID = "<YOUR_FABRIC_NOTEBOOK_OR_PIPELINE_ITEM_ID>"
-ONELAKE_PATH = "abfss://Project1_apacheAirflow@onelake.dfs.fabric.microsoft.com/amazon.Lakehouse/Files/raw_data/books.csv"
-
+CONTAINER_NAME = "Project1_apacheAirflow"
+DIRECTORY_PATH = "amazon.Lakehouse/Files/raw_data"
+FILE_NAME = "books.csv"
 
 HEADERS = {
     "Referer": "https://www.amazon.com/",
@@ -37,16 +38,14 @@ HEADERS = {
     ),
 }
 
+USE_OPENLIBRARY_FALLBACK = True
+
 # ────────────────────────────────────────────────
 # ETL TASKS
 # ────────────────────────────────────────────────
 
-from airflow.exceptions import AirflowFailException
-import time, random
-
-USE_OPENLIBRARY_FALLBACK = True
-
 def fetch_amazon_books(num_books, **context):
+    """Scrape book data from Amazon or fallback to OpenLibrary."""
     ti = context["ti"]
     base_url = "https://www.amazon.com/s?k=data+engineering+books"
     books, seen = [], set()
@@ -54,14 +53,13 @@ def fetch_amazon_books(num_books, **context):
     session.headers.update(HEADERS)
 
     page = 1
-    while len(books) < num_books and page <= 5:  # cap pages to avoid long crawls
+    while len(books) < num_books and page <= 5:
         url = f"{base_url}&page={page}"
         r = session.get(url, timeout=30)
         if r.status_code != 200:
             break
 
         soup = BeautifulSoup(r.content, "html.parser")
-        # slightly more permissive selectors
         for item in soup.select("div.s-result-item"):
             title_el = item.select_one("h2 a span.a-text-normal") or item.select_one("span.a-text-normal")
             author_el = item.select_one("a.a-size-base")
@@ -71,7 +69,6 @@ def fetch_amazon_books(num_books, **context):
 
             if not title_el:
                 continue
-
             title = title_el.get_text(strip=True)
             if title in seen:
                 continue
@@ -94,9 +91,8 @@ def fetch_amazon_books(num_books, **context):
             })
 
         page += 1
-        time.sleep(random.uniform(1.0, 2.0))  # be polite
+        time.sleep(random.uniform(1.0, 2.0))
 
-    # If nothing came back, optionally fall back to OpenLibrary (public API)
     if len(books) == 0 and USE_OPENLIBRARY_FALLBACK:
         ol = requests.get(
             "https://openlibrary.org/search.json",
@@ -109,20 +105,19 @@ def fetch_amazon_books(num_books, **context):
                 "Title": d.get("title"),
                 "Author": ", ".join(d.get("author_name", [])[:1]) or None,
                 "Price": None,
-                "Rating": d.get("ratings_average"),  # may be None
+                "Rating": d.get("ratings_average"),
             })
 
-    # Fail fast if still nothing (so downstream doesn't run pointlessly)
     if len(books) == 0:
-        raise AirflowFailException("Fetch returned 0 rows (site blocked / structure changed).")
+        raise AirflowFailException("❌ No books fetched from either source.")
 
     df = pd.DataFrame(books[:num_books]).drop_duplicates(subset="Title")
     ti.xcom_push(key="book_data", value=df.to_dict("records"))
-    print(f"✅ Extracted {len(df)} rows")
-
+    print(f"✅ Extracted {len(df)} books from Amazon/OpenLibrary.")
 
 
 def clean_book_data(**context):
+    """Clean book data for consistency."""
     ti = context["ti"]
     book_data = ti.xcom_pull(key="book_data", task_ids="fetch_amazon_books")
     if not book_data:
@@ -131,7 +126,7 @@ def clean_book_data(**context):
     df = pd.DataFrame(book_data)
     df["etl_processed_at"] = datetime.utcnow().isoformat()
     df["Price"] = (
-    df["Price"].astype(str)
+        df["Price"].astype(str)
         .str.replace(",", "", regex=False)
         .replace("None", pd.NA)
     )
@@ -142,36 +137,46 @@ def clean_book_data(**context):
         .fillna(0)
     )
 
-
-    # Push back to XCom instead of saving locally
     ti.xcom_push(key="cleaned_books", value=df.to_dict("records"))
-    print(f"✅ Cleaned {len(df)} books")
+    print(f"✅ Cleaned {len(df)} books successfully.")
+
 
 def upload_to_onelake(**context):
+    """Upload cleaned CSV to OneLake using Azure Data Lake client."""
     ti = context["ti"]
     cleaned_books = ti.xcom_pull(key="cleaned_books", task_ids="clean_book_data")
     if not cleaned_books:
         raise ValueError("No cleaned book data found")
 
     df = pd.DataFrame(cleaned_books)
-    csv_data = StringIO()
-    df.to_csv(csv_data, index=False)
-    csv_data.seek(0)
+    local_csv = "/tmp/books.csv"
+    df.to_csv(local_csv, index=False)
 
-    # Connect to OneLake (same as ADLS Gen2)
+    print("📂 Temporary file created at:", local_csv)
+
+    # Authenticate with Managed Identity or Service Principal
+    credential = DefaultAzureCredential()
     service_client = DataLakeServiceClient(
         account_url="https://onelake.dfs.fabric.microsoft.com",
-        credential=os.getenv("FABRIC_ACCESS_TOKEN")  # use Managed Identity or Fabric Connection
+        credential=credential
     )
 
-    # Replace with your container and path
-    file_system = service_client.get_file_system_client("Project1_apacheAirflow")
-    directory_client = file_system.get_directory_client("amazon.Lakehouse/Files/raw_data")
-    file_client = directory_client.create_file("books.csv")
-    file_client.append_data(csv_data.getvalue(), offset=0, length=len(csv_data.getvalue()))
-    file_client.flush_data(len(csv_data.getvalue()))
+    file_system_client = service_client.get_file_system_client(CONTAINER_NAME)
+    directory_client = file_system_client.get_directory_client(DIRECTORY_PATH)
 
-    print("✅ Uploaded CSV to OneLake (ADLS Gen2 compatible).")
+    # Create directory if not exists
+    try:
+        directory_client.create_directory()
+    except Exception:
+        pass
+
+    file_client = directory_client.create_file(FILE_NAME)
+    with open(local_csv, "rb") as f:
+        file_content = f.read()
+        file_client.append_data(file_content, offset=0, length=len(file_content))
+        file_client.flush_data(len(file_content))
+
+    print(f"✅ Successfully uploaded {FILE_NAME} to OneLake path {DIRECTORY_PATH}.")
 
 
 # ────────────────────────────────────────────────
@@ -210,15 +215,4 @@ with DAG(
         python_callable=upload_to_onelake,
     )
 
-    #trigger_fabric_notebook = FabricRunItemOperator(
-     #   task_id="trigger_fabric_notebook",
-      #  fabric_conn_id=FABRIC_CONN_ID,
-       # workspace_id=FABRIC_WORKSPACE_ID,
-        #item_id=FABRIC_NOTEBOOK_ITEM_ID,
-        #check_interval_seconds=10,
-        #timeout_seconds=3600,
-    
-
     fetch_amazon_books_task >> clean_book_data_task >> upload_to_onelake_task
-
-

@@ -124,46 +124,31 @@ def clean_book_data(**context):
     ti = context["ti"]
     book_data = ti.xcom_pull(key="book_data", task_ids="fetch_amazon_books")
     if not book_data:
-        raise AirflowFailException("No book data in XCom from fetch task.")
+        raise ValueError("No book data found for cleaning")
 
     df = pd.DataFrame(book_data)
     df["etl_processed_at"] = datetime.utcnow().isoformat()
+    df["Price"] = df["Price"].astype(str).str.replace(",", "")
+    df["Rating"] = df["Rating"].astype(str).str.extract(r"(\d+\.\d+)").astype(float)
 
-    # Price: keep numeric value if present
-    price_num = (
-        df["Price"]
-        .astype(str)
-        .str.replace(",", "", regex=False)
-        .str.extract(r"(\d+(?:\.\d+)?)")[0]
-    )
-    df["Price"] = pd.to_numeric(price_num, errors="coerce")
-
-    # Rating: extract number if it's like "4.7 out of 5 stars" or pass through numeric
-    rating_num = df["Rating"].astype(str).str.extract(r"(\d+(?:\.\d+)?)")[0]
-    df["Rating"] = pd.to_numeric(rating_num, errors="coerce")
-
-    file_path = "/tmp/amazon_books_clean.csv"
-    df.to_csv(file_path, index=False)
-    ti.xcom_push(key="clean_file_path", value=file_path)
-    print(f"✅ Cleaned {len(df)} rows → {file_path}")
+    # Push back to XCom instead of saving locally
+    ti.xcom_push(key="cleaned_books", value=df.to_dict("records"))
+    print(f"✅ Cleaned {len(df)} books")
 
 
+def upload_to_onelake(**context):
+    ti = context["ti"]
+    cleaned_books = ti.xcom_pull(key="cleaned_books", task_ids="clean_book_data")
+    if not cleaned_books:
+        raise ValueError("No cleaned book data found")
 
-def upload_to_onelake(ti):
-    import shutil
+    df = pd.DataFrame(cleaned_books)
+    local_path = "/lakehouse/default/Files/raw_data/books.csv"  # mounted path in Fabric
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    df.to_csv(local_path, index=False)
 
-    file_path = ti.xcom_pull(key="clean_file_path", task_ids="clean_book_data")
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
+    print(f"✅ Uploaded to OneLake: {local_path}")
 
-    # Copy the file into OneLake path
-    destination = ONELAKE_PATH
-
-    # OneLake is mounted in Fabric runtime, so we can write directly to the path
-    shutil.copy(file_path, destination.replace("abfss://", "/lakehouse/default/"))  # local mount path for Fabric
-
-    print(f"✅ Uploaded to OneLake: {destination}")
-    ti.xcom_push(key="onelake_path", value=destination)
 
 # ────────────────────────────────────────────────
 # DAG DEFINITION

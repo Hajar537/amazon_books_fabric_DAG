@@ -39,59 +39,114 @@ HEADERS = {
 # ETL TASKS
 # ────────────────────────────────────────────────
 
-def FETCH_amazon_books(num_books, ti):
+from airflow.exceptions import AirflowFailException
+import time, random
+
+USE_OPENLIBRARY_FALLBACK = True
+
+def fetch_amazon_books(num_books, **context):
+    ti = context["ti"]
     base_url = "https://www.amazon.com/s?k=data+engineering+books"
-    books, seen_titles = [], set()
+    books, seen = [], set()
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
     page = 1
-
-    while len(books) < num_books:
+    while len(books) < num_books and page <= 5:  # cap pages to avoid long crawls
         url = f"{base_url}&page={page}"
-        response = requests.get(url, headers=HEADERS, timeout=30)
-
-        if response.status_code != 200:
-            print(f"❌ Failed to retrieve page {page}")
+        r = session.get(url, timeout=30)
+        if r.status_code != 200:
             break
 
-        soup = BeautifulSoup(response.content, "html.parser")
-        book_containers = soup.find_all("div", {"class": "s-result-item"})
+        soup = BeautifulSoup(r.content, "html.parser")
+        # slightly more permissive selectors
+        for item in soup.select("div.s-result-item"):
+            title_el = item.select_one("h2 a span.a-text-normal") or item.select_one("span.a-text-normal")
+            author_el = item.select_one("a.a-size-base")
+            price_whole = item.select_one("span.a-price-whole")
+            price_frac  = item.select_one("span.a-price-fraction")
+            rating_el = item.select_one("span.a-icon-alt")
 
-        for book in book_containers:
-            title = book.find("span", {"class": "a-text-normal"})
-            author = book.find("a", {"class": "a-size-base"})
-            price = book.find("span", {"class": "a-price-whole"})
-            rating = book.find("span", {"class": "a-icon-alt"})
+            if not title_el:
+                continue
 
-            if title and author and price and rating:
-                book_title = title.text.strip()
-                if book_title not in seen_titles:
-                    seen_titles.add(book_title)
-                    books.append({
-                        "Title": book_title,
-                        "Author": author.text.strip(),
-                        "Price": price.text.strip(),
-                        "Rating": rating.text.strip(),
-                    })
+            title = title_el.get_text(strip=True)
+            if title in seen:
+                continue
+            seen.add(title)
+
+            price = None
+            if price_whole:
+                pw = price_whole.get_text(strip=True).replace(",", "")
+                pf = price_frac.get_text(strip=True) if price_frac else "0"
+                price = f"{pw}.{pf}"
+
+            rating = rating_el.get_text(strip=True) if rating_el else None
+            author = author_el.get_text(strip=True) if author_el else None
+
+            books.append({
+                "Title": title,
+                "Author": author,
+                "Price": price,
+                "Rating": rating,
+            })
 
         page += 1
+        time.sleep(random.uniform(1.0, 2.0))  # be polite
+
+    # If nothing came back, optionally fall back to OpenLibrary (public API)
+    if len(books) == 0 and USE_OPENLIBRARY_FALLBACK:
+        ol = requests.get(
+            "https://openlibrary.org/search.json",
+            params={"q": "data engineering", "limit": num_books},
+            timeout=30
+        ).json()
+        docs = ol.get("docs", [])
+        for d in docs:
+            books.append({
+                "Title": d.get("title"),
+                "Author": ", ".join(d.get("author_name", [])[:1]) or None,
+                "Price": None,
+                "Rating": d.get("ratings_average"),  # may be None
+            })
+
+    # Fail fast if still nothing (so downstream doesn't run pointlessly)
+    if len(books) == 0:
+        raise AirflowFailException("Fetch returned 0 rows (site blocked / structure changed).")
 
     df = pd.DataFrame(books[:num_books]).drop_duplicates(subset="Title")
     ti.xcom_push(key="book_data", value=df.to_dict("records"))
-    print(f"✅ Extracted {len(df)} books")
+    print(f"✅ Extracted {len(df)} rows")
 
 
-def clean_book_data(ti):
+
+def clean_book_data(**context):
+    ti = context["ti"]
     book_data = ti.xcom_pull(key="book_data", task_ids="fetch_amazon_books")
     if not book_data:
-        raise ValueError("No book data found for cleaning")
+        raise AirflowFailException("No book data in XCom from fetch task.")
 
     df = pd.DataFrame(book_data)
     df["etl_processed_at"] = datetime.utcnow().isoformat()
-    df["Price"] = df["Price"].str.replace(",", "")
-    df["Rating"] = df["Rating"].str.extract(r"(\d+\.\d+)").astype(float)
+
+    # Price: keep numeric value if present
+    price_num = (
+        df["Price"]
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .str.extract(r"(\d+(?:\.\d+)?)")[0]
+    )
+    df["Price"] = pd.to_numeric(price_num, errors="coerce")
+
+    # Rating: extract number if it's like "4.7 out of 5 stars" or pass through numeric
+    rating_num = df["Rating"].astype(str).str.extract(r"(\d+(?:\.\d+)?)")[0]
+    df["Rating"] = pd.to_numeric(rating_num, errors="coerce")
+
     file_path = "/tmp/amazon_books_clean.csv"
     df.to_csv(file_path, index=False)
     ti.xcom_push(key="clean_file_path", value=file_path)
-    print("✅ Data cleaned and saved locally")
+    print(f"✅ Cleaned {len(df)} rows → {file_path}")
+
 
 
 def upload_to_onelake(ti):
@@ -130,11 +185,12 @@ with DAG(
     tags=["fabric", "onelake", "amazon", "etl"],
 ) as dag:
 
-    FETCH_amazon_books_task = PythonOperator(
+    fetch_amazon_books_task = PythonOperator(
         task_id="fetch_amazon_books",
-        python_callable=FETCH_amazon_books,
+        python_callable=fetch_amazon_books,
         op_args=[NUM_BOOKS],
     )
+
 
     clean_book_data_task = PythonOperator(
         task_id="clean_book_data",

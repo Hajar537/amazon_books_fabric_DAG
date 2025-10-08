@@ -20,10 +20,8 @@ NUM_BOOKS = 50
 FABRIC_CONN_ID = "amazon-books"             # connection name in Airflow UI
 FABRIC_WORKSPACE_ID = "<YOUR_FABRIC_WORKSPACE_ID>"
 FABRIC_NOTEBOOK_ITEM_ID = "<YOUR_FABRIC_NOTEBOOK_OR_PIPELINE_ITEM_ID>"
-STORAGE_ACCOUNT_URL = os.getenv("AZURE_STORAGE_ACCOUNT_URL")  # or set Airflow variable
-STORAGE_CONTAINER = "fabric-data"
-SAS_TOKEN = os.getenv("AZURE_SAS_TOKEN")  # or managed identity
-UPLOAD_BLOB_PATH = "amazon/books.csv"
+ONELAKE_PATH = "abfss://Project1_apacheAirflow@onelake.dfs.fabric.microsoft.com/amazon.Lakehouse/Files/raw_data/books.csv"
+
 
 HEADERS = {
     "Referer": "https://www.amazon.com/",
@@ -97,19 +95,20 @@ def clean_book_data(ti):
 
 
 def upload_to_onelake(ti):
+    import shutil
+
     file_path = ti.xcom_pull(key="clean_file_path", task_ids="clean_book_data")
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
 
-    blob_service = BlobServiceClient(account_url=STORAGE_ACCOUNT_URL, credential=SAS_TOKEN)
-    container_client = blob_service.get_container_client(STORAGE_CONTAINER)
+    # Copy the file into OneLake path
+    destination = ONELAKE_PATH
 
-    with open(file_path, "rb") as data:
-        container_client.upload_blob(name=UPLOAD_BLOB_PATH, data=data, overwrite=True)
+    # OneLake is mounted in Fabric runtime, so we can write directly to the path
+    shutil.copy(file_path, destination.replace("abfss://", "/lakehouse/default/"))  # local mount path for Fabric
 
-    blob_url = f"{STORAGE_ACCOUNT_URL}/{STORAGE_CONTAINER}/{UPLOAD_BLOB_PATH}"
-    ti.xcom_push(key="blob_url", value=blob_url)
-    print(f"✅ Uploaded to OneLake: {blob_url}")
+    print(f"✅ Uploaded to OneLake: {destination}")
+    ti.xcom_push(key="onelake_path", value=destination)
 
 # ────────────────────────────────────────────────
 # DAG DEFINITION

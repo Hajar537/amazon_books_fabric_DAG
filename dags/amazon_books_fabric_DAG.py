@@ -10,6 +10,8 @@ from airflow.operators.python import PythonOperator
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
+from azure.storage.filedatalake import DataLakeServiceClient
+from io import StringIO
 #from azure.storage.blob import BlobServiceClient
 import os
 
@@ -145,7 +147,6 @@ def clean_book_data(**context):
     ti.xcom_push(key="cleaned_books", value=df.to_dict("records"))
     print(f"✅ Cleaned {len(df)} books")
 
-
 def upload_to_onelake(**context):
     ti = context["ti"]
     cleaned_books = ti.xcom_pull(key="cleaned_books", task_ids="clean_book_data")
@@ -153,11 +154,24 @@ def upload_to_onelake(**context):
         raise ValueError("No cleaned book data found")
 
     df = pd.DataFrame(cleaned_books)
-    local_path = "/lakehouse/amzon/Files/raw_data/books.csv"  # mounted path in Fabric
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    df.to_csv(local_path, index=False)
+    csv_data = StringIO()
+    df.to_csv(csv_data, index=False)
+    csv_data.seek(0)
 
-    print(f"✅ Uploaded to OneLake: {local_path}")
+    # Connect to OneLake (same as ADLS Gen2)
+    service_client = DataLakeServiceClient(
+        account_url="https://onelake.dfs.fabric.microsoft.com",
+        credential=os.getenv("FABRIC_ACCESS_TOKEN")  # use Managed Identity or Fabric Connection
+    )
+
+    # Replace with your container and path
+    file_system = service_client.get_file_system_client("Project1_apacheAirflow")
+    directory_client = file_system.get_directory_client("amazon.Lakehouse/Files/raw_data")
+    file_client = directory_client.create_file("books.csv")
+    file_client.append_data(csv_data.getvalue(), offset=0, length=len(csv_data.getvalue()))
+    file_client.flush_data(len(csv_data.getvalue()))
+
+    print("✅ Uploaded CSV to OneLake (ADLS Gen2 compatible).")
 
 
 # ────────────────────────────────────────────────

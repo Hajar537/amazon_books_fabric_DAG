@@ -18,8 +18,8 @@ import os
 # ────────────────────────────────────────────────
 NUM_BOOKS = 50
 FABRIC_CONN_ID = "amazon-books"             # connection name in Airflow UI
-FABRIC_WORKSPACE_ID = "<YOUR_FABRIC_WORKSPACE_ID>"
-FABRIC_NOTEBOOK_ITEM_ID = "<YOUR_FABRIC_NOTEBOOK_OR_PIPELINE_ITEM_ID>"
+#FABRIC_WORKSPACE_ID = "<YOUR_FABRIC_WORKSPACE_ID>"
+#FABRIC_NOTEBOOK_ITEM_ID = "<YOUR_FABRIC_NOTEBOOK_OR_PIPELINE_ITEM_ID>"
 ONELAKE_PATH = "abfss://Project1_apacheAirflow@onelake.dfs.fabric.microsoft.com/amazon.Lakehouse/Files/raw_data/books.csv"
 
 

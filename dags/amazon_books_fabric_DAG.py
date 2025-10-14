@@ -141,42 +141,88 @@ def clean_book_data(**context):
     print(f"✅ Cleaned {len(df)} books successfully.")
 
 
+
 def upload_to_onelake(**context):
-    """Upload cleaned CSV to OneLake using Azure Data Lake client."""
+    """
+    Upload cleaned CSV to OneLake (ADLS Gen2 compatible) with robust logging:
+    - Prefer SAS via ONELAKE_SAS_TOKEN if present (quickest to validate)
+    - Else use DefaultAzureCredential (Managed Identity / SP)
+    - Verifies file system and directory, creates directory if needed
+    """
+    from azure.storage.filedatalake import DataLakeServiceClient
+    from azure.identity import DefaultAzureCredential
+    import os, traceback
+
     ti = context["ti"]
     cleaned_books = ti.xcom_pull(key="cleaned_books", task_ids="clean_book_data")
     if not cleaned_books:
         raise ValueError("No cleaned book data found")
 
+    # 0) Write local CSV
+    import pandas as pd
     df = pd.DataFrame(cleaned_books)
     local_csv = "/tmp/books.csv"
     df.to_csv(local_csv, index=False)
+    print(f"[upload] local_csv={local_csv} rows={len(df)}")
 
-    print("📂 Temporary file created at:", local_csv)
+    ACCOUNT_URL = "https://onelake.dfs.fabric.microsoft.com"
+    FILE_SYSTEM = "Project1_apacheAirflow"                 # your workspace "container"
+    DIRECTORY   = "amazon.Lakehouse/Files/raw_data"        # lakehouse + Files path
+    FILE_NAME   = "books.csv"
 
-    # Authenticate with Managed Identity or Service Principal
-    credential = DefaultAzureCredential()
-    service_client = DataLakeServiceClient(
-        account_url="https://onelake.dfs.fabric.microsoft.com",
-        credential=credential
-    )
+    # 1) Choose credential
+    sas = os.getenv("ONELAKE_SAS_TOKEN")
+    if sas:
+        print("[upload] Using SAS token from ONELAKE_SAS_TOKEN")
+        service_client = DataLakeServiceClient(account_url=ACCOUNT_URL, credential=sas)
+    else:
+        print("[upload] Using DefaultAzureCredential()")
+        cred = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+        service_client = DataLakeServiceClient(account_url=ACCOUNT_URL, credential=cred)
 
-    file_system_client = service_client.get_file_system_client(CONTAINER_NAME)
-    directory_client = file_system_client.get_directory_client(DIRECTORY_PATH)
-
-    # Create directory if not exists
     try:
-        directory_client.create_directory()
-    except Exception:
-        pass
+        # 2) Verify file system (container = workspace)
+        fs_client = service_client.get_file_system_client(FILE_SYSTEM)
+        exists = False
+        try:
+            # list_paths will fail if FS doesn't exist or permission denied
+            _ = next(fs_client.get_paths(path="", max_results=1), None)
+            exists = True
+        except Exception as e:
+            print(f"[upload] file system check error: {type(e).__name__}: {e}")
+        if not exists:
+            raise RuntimeError(
+                f"File system '{FILE_SYSTEM}' not accessible. "
+                "Check that this name EXACTLY matches your Fabric workspace "
+                "and that the identity has permissions."
+            )
+        print(f"[upload] file system OK: {FILE_SYSTEM}")
 
-    file_client = directory_client.create_file(FILE_NAME)
-    with open(local_csv, "rb") as f:
-        file_content = f.read()
-        file_client.append_data(file_content, offset=0, length=len(file_content))
-        file_client.flush_data(len(file_content))
+        # 3) Ensure directory
+        dir_client = fs_client.get_directory_client(DIRECTORY)
+        try:
+            dir_client.create_directory()
+            print(f"[upload] created directory: {DIRECTORY}")
+        except Exception:
+            print(f"[upload] directory exists: {DIRECTORY}")
 
-    print(f"✅ Successfully uploaded {FILE_NAME} to OneLake path {DIRECTORY_PATH}.")
+        # 4) Create/overwrite file
+        file_client = dir_client.create_file(FILE_NAME)
+        with open(local_csv, "rb") as f:
+            data = f.read()
+            file_client.append_data(data=data, offset=0, length=len(data))
+            file_client.flush_data(len(data))
+        print(f"[upload] ✅ uploaded to onelake: {FILE_SYSTEM}/{DIRECTORY}/{FILE_NAME}")
+
+        # Optional: push the ABFS path for downstream tasks
+        abfs_path = f"abfss://{FILE_SYSTEM}@onelake.dfs.fabric.microsoft.com/{DIRECTORY}/{FILE_NAME}"
+        ti.xcom_push(key="onelake_abfs_path", value=abfs_path)
+        print(f"[upload] abfs_path={abfs_path}")
+
+    except Exception as e:
+        print("[upload] ❌ upload failed")
+        traceback.print_exc()
+        raise
 
 
 # ────────────────────────────────────────────────
@@ -203,6 +249,8 @@ with DAG(
         task_id="fetch_amazon_books",
         python_callable=fetch_amazon_books,
         op_args=[NUM_BOOKS],
+        execution_timeout=timedelta(minutes=10),
+        retries=0,
     )
 
     clean_book_data_task = PythonOperator(
@@ -213,6 +261,8 @@ with DAG(
     upload_to_onelake_task = PythonOperator(
         task_id="upload_to_onelake",
         python_callable=upload_to_onelake,
+        execution_timeout=timedelta(minutes=10),
+        retries=0,
     )
 
     fetch_amazon_books_task >> clean_book_data_task >> upload_to_onelake_task
